@@ -11,7 +11,3 @@ spec:
   - step: resolve-kubecore-context
     functionRef:
       name: function-kubecore-app-resolver
-    input:
-      apiVersion: resolver.fn.kubecore.io/v1beta1
-      kind: Input
-      # No fields required for now
