@@ -25,9 +25,9 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Documentation = "https://github.com/crossplane/function-template-python#readme"
-Issues = "https://github.com/crossplane/function-template-python/issues"
-Source = "https://github.com/crossplane/function-template-python"
+Documentation = "https://github.com/novelcore/function-kubecore-app-resolver#readme"
+Issues = "https://github.com/novelcore/function-kubecore-app-resolver/issues"
+Source = "https://github.com/novelcore/function-kubecore-app-resolver"
 
 [project.scripts]
 function = "function.main:cli"
