@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "function"
-description = 'A composition function'
+name = "function-kubecore-app-resolver"
+description = 'A Crossplane composition function that resolves Kubecore App context (Python)'
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = "Apache-2.0"
 keywords = []
-authors = [{ name = "Crossplane Maintainers", email = "info@crossplane.io" }]
+authors = [{ name = "Novelcore", email = "opensource@novelcore.io" }]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
@@ -17,9 +17,10 @@ classifiers = [
 ]
 
 dependencies = [
-  "crossplane-function-sdk-python==0.8.0",
+  "crossplane-function-sdk-python==0.9.0",
   "click==8.2.1",
-  "grpcio==1.73.1",
+  "grpcio==1.74.0",
+  "protobuf>=5,<6",
 ]
 
 dynamic = ["version"]
@@ -49,7 +50,7 @@ development = "python function/main.py --insecure --debug"
 
 # This special environment is used by hatch fmt.
 [tool.hatch.envs.hatch-static-analysis]
-dependencies = ["ruff==0.12.7"]
+dependencies = ["ruff==0.12.8"]
 config-path = "none"           # Disable Hatch's default Ruff config.
 
 [tool.ruff]
