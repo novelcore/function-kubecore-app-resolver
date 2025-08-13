@@ -1,13 +1,69 @@
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
-  name: function-kubecore-app-resolver
+  name: k8s-app-smart.app.kubecore.io
+  labels:
+    crossplane.io/xrd: xapps.app.kubecore.io
+    provider: k8s
+    service: app-manifests
+    version: v-test-resolver
+    implementation: resolver-test
 spec:
   compositeTypeRef:
-    apiVersion: example.crossplane.io/v1
-    kind: XR
+    apiVersion: app.kubecore.io/v1alpha1
+    kind: XApp
   mode: Pipeline
   pipeline:
-  - step: resolve-kubecore-context
+
+  # STEP 1: Resolve App context (your Python function)
+  - step: resolve-app-context
     functionRef:
       name: function-kubecore-app-resolver
+    input:
+      apiVersion: context.kubecore.io/v1alpha1
+      kind: AppContextResolverInput
+
+  # STEP 2: Dump resolved context to a RepositoryFile for inspection
+  - step: render-report
+    functionRef:
+      name: function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      kind: GoTemplate
+      source: Inline
+      inline:
+        template: |
+          {{ $ctx := index .context "apiextensions.crossplane.io/context.kubecore.io" }}
+          {{ $resolved := index $ctx "appResolved" }}
+          {{ $xr := .observed.composite.resource }}
+          {{ $claim := $xr.spec.claimRef.name }}
+          ---
+          apiVersion: repo.github.upbound.io/v1alpha1
+          kind: RepositoryFile
+          metadata:
+            name: {{ $claim }}-resolver-report
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: resolver-report
+          spec:
+            forProvider:
+              branch: main
+              commitAuthor: kubecore-xapp[bot]
+              commitEmail: kubecore-xapp[bot]@kubecore.eu
+              commitMessage: "App resolver report for {{ $claim }}"
+              file: tests/xapp-resolver/{{ $claim }}/resolved.yaml
+              overwriteOnCreate: true
+              content: |
+                {{ toYaml $resolved | indent 16 }}
+              repositorySelector:
+                matchLabels:
+                  kubecore.eu/kubeproject: {{ $xr.spec.githubProjectRef.name }}
+            providerConfigRef:
+              name: {{ or $xr.spec.providerConfigRef.github "github-default" }}
+
+  # STEP 3: Auto-ready (optional)
+  - step: auto-ready
+    functionRef:
+      name: function-auto-ready
+    input:
+      apiVersion: autoready.fn.crossplane.io/v1beta1
+      kind: Input

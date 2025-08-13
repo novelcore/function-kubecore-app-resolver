@@ -21,6 +21,7 @@ dependencies = [
   "click==8.2.1",
   "grpcio==1.74.0",
   "protobuf==6.31.1",
+  "kubernetes==29.0.0",
 ]
 
 dynamic = ["version"]

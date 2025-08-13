@@ -3,4 +3,13 @@ apiVersion: meta.pkg.crossplane.io/v1beta1
 kind: Function
 metadata:
   name: function-kubecore-app-resolver
-spec: {}
+spec:
+  # Minimal RBAC for read-only cluster lookups performed by the function runtime.
+  permissions:
+    rules:
+    - apiGroups: ["platform.kubecore.io"]
+      resources: ["xkubenenvs"]
+      verbs: ["get", "list"]
+    - apiGroups: ["github.platform.kubecore.io"]
+      resources: ["xgithubprojects"]
+      verbs: ["get", "list"]
