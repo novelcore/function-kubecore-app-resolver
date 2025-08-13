@@ -119,10 +119,6 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         resolved = ctx["appResolved"]
         self.assertEqual(resolved["app"]["name"], "art-api")
         self.assertEqual(resolved["project"]["name"], "demo-project")
-        self.assertEqual(
-            resolved["project"].get("providerConfigs", {}).get("github"),
-            "github-default",
-        )
         names = [e["name"] for e in resolved["environments"]]
         self.assertEqual(names, ["demo-dev", "demo-dev-v2"])  # first-wins keeps order
         self.assertEqual(resolved["summary"]["counts"]["missing"], 0)
@@ -180,13 +176,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         )
 
         # Ensure kubenvLookup contains ONLY canonical keys and aliases are under
-        # kubenvLookupAliases
+        # canonical keys only (no plain-name aliases)
         lookup = ctx.get("kubenvLookup", {})
         self.assertIn("default/demo-dev", lookup)
         self.assertNotIn("demo-dev", lookup)
-        aliases = ctx.get("kubenvLookupAliases", {})
-        self.assertIn("demo-dev", aliases)
-        self.assertIn("default/demo-dev", aliases["demo-dev"])  # canonical mapping
 
     async def test_no_environments(self) -> None:
         xr = {
@@ -323,6 +316,168 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             resolved["summary"]["counts"],
             {"referenced": 2, "found": 2, "missing": 0},
+        )
+
+    async def test_commit_statuses_from_gates_single_env(self) -> None:
+        xr = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "XApp",
+            "metadata": {"name": "art-api"},
+            "spec": {
+                "environments": [
+                    {
+                        "kubenvRef": {"name": "demo-dev", "namespace": "test"},
+                        "enabled": True,
+                    }
+                ]
+            },
+        }
+
+        kubenv_item = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "KubEnv",
+            "metadata": {
+                "name": "demo-dev",
+                "namespace": "test",
+                "labels": {"crossplane.io/claim-name": "demo-dev"},
+            },
+            "spec": {
+                "resources": {
+                    "defaults": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits": {"cpu": "500m", "memory": "256Mi"},
+                    }
+                },
+                "environmentConfig": {"variables": {"ENVIRONMENT": "development"}},
+                "qualityGates": [
+                    {
+                        "ref": {"name": "smoke-test-gate", "namespace": "test"},
+                        "key": "smoke-test",
+                        "phase": "active",
+                        "required": True,
+                    },
+                    {
+                        "ref": {"name": "security-scan-gate", "namespace": "test"},
+                        "key": "security-scan",
+                        "phase": "proposed",
+                        "required": True,
+                    },
+                ],
+            },
+        }
+
+        class DummyLister:
+            def list_kubenvs_in_namespace(self, namespace):  # noqa: ARG002
+                return [kubenv_item]
+
+            def list_xgithubprojects_by_claim(self, name, namespace):  # noqa: ARG002
+                return []
+
+        req = fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=fnv1.Resource(resource=resource.dict_to_struct(xr)),
+            )
+        )
+        runner = fn.FunctionRunner(lister=DummyLister())
+        got = await runner.RunFunction(req, None)
+        got_dict = json_format.MessageToDict(got)
+        resolved_envs = got_dict["context"][
+            "apiextensions.crossplane.io/context.kubecore.io"
+        ]["appResolved"]["environments"]
+        self.assertEqual(len(resolved_envs), 1)
+        eff = resolved_envs[0]["effective"]
+        self.assertEqual(
+            eff["commitStatuses"],
+            {
+                "activeCommitStatuses": [{"key": "smoke-test"}],
+                "proposedCommitStatuses": [{"key": "security-scan"}],
+            },
+        )
+        # Ensure quality gates echo back the merged list with required fields
+        gates = eff["qualityGates"]
+        self.assertEqual(len(gates), 2)
+        self.assertEqual(gates[0]["ref"]["name"], "smoke-test-gate")
+        self.assertEqual(gates[0]["phase"], "active")
+        self.assertTrue(gates[0]["required"])
+
+    async def test_gate_merge_precedence_overrides_win(self) -> None:
+        xr = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "XApp",
+            "metadata": {"name": "art-api"},
+            "spec": {
+                "environments": [
+                    {
+                        "kubenvRef": {"name": "demo-dev", "namespace": "test"},
+                        "enabled": True,
+                        "overrides": {
+                            "qualityGates": [
+                                {
+                                    "ref": {
+                                        "name": "smoke-test-gate",
+                                        "namespace": "test",
+                                    },
+                                    "key": "smoke-override",
+                                    "phase": "proposed",
+                                    "required": False,
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+        kubenv_item = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "KubEnv",
+            "metadata": {
+                "name": "demo-dev",
+                "namespace": "test",
+                "labels": {"crossplane.io/claim-name": "demo-dev"},
+            },
+            "spec": {
+                "qualityGates": [
+                    {
+                        "ref": {"name": "smoke-test-gate", "namespace": "test"},
+                        "key": "smoke-test",
+                        "phase": "active",
+                        "required": True,
+                    }
+                ]
+            },
+        }
+
+        class DummyLister:
+            def list_kubenvs_in_namespace(self, namespace):  # noqa: ARG002
+                return [kubenv_item]
+
+            def list_xgithubprojects_by_claim(self, name, namespace):  # noqa: ARG002
+                return []
+
+        req = fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=fnv1.Resource(resource=resource.dict_to_struct(xr)),
+            )
+        )
+        runner = fn.FunctionRunner(lister=DummyLister())
+        got = await runner.RunFunction(req, None)
+        got_dict = json_format.MessageToDict(got)
+        eff = got_dict["context"][
+            "apiextensions.crossplane.io/context.kubecore.io"
+        ]["appResolved"]["environments"][0]["effective"]
+        # Override wins for key/phase/required
+        gates = eff["qualityGates"]
+        self.assertEqual(len(gates), 1)
+        self.assertEqual(gates[0]["key"], "smoke-override")
+        self.assertEqual(gates[0]["phase"], "proposed")
+        self.assertFalse(gates[0]["required"])  # override set False
+        # Commit-status reflects override
+        self.assertEqual(
+            eff["commitStatuses"],
+            {
+                "activeCommitStatuses": [],
+                "proposedCommitStatuses": [{"key": "smoke-override"}],
+            },
         )
 
 

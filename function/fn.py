@@ -231,45 +231,95 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         project_ref = _get(xr, ["spec", "githubProjectRef"], {}) or {}
         project_name = project_ref.get("name")
         project_namespace = project_ref.get("namespace")
+        # Do not fetch external project resources; only echo minimal reference data
+        project_obj = {
+            "name": project_name,
+            "namespace": project_namespace,
+            "providerConfigs": {},
+        }
 
-        # Resolve project
-        project_obj, project_warning = _resolve_project(
-            self._lister, project_name, project_namespace
-        )
-        if project_warning:
-            response.warning(rsp, project_warning)
+        # Normalize environments from both shapes and de-duplicate by canonical key
+        def _normalize_envs(app: dict[str, Any]) -> list[dict[str, Any]]:
+            normalized: list[dict[str, Any]] = []
+            # Shape A: spec.environments[] (display name == KubEnv name)
+            for env in _get(app, ["spec", "environments"], []) or []:
+                env_obj = env or {}
+                kubenv_ref = env_obj.get("kubenvRef", {}) or {}
+                kubenv_name = kubenv_ref.get("name")
+                if not kubenv_name:
+                    self.log.error(
+                        "kubenv.ref.missing",
+                        message="environment entry without kubenvRef.name encountered; marking missing",
+                    )
+                    continue
+                kubenv_ns = kubenv_ref.get("namespace", "default")
+                normalized.append(
+                    {
+                        "name": kubenv_name,  # display
+                        "namespace": kubenv_ns,  # display
+                        "kubenvName": kubenv_name,
+                        "kubenvNamespace": kubenv_ns,
+                        "canonical": f"{kubenv_ns}/{kubenv_name}",
+                        "enabled": bool(env_obj.get("enabled", False)),
+                        "overrides": (env_obj.get("overrides", {}) or {}),
+                    }
+                )
+            # Shape B: spec.kubenvs.{dev,staging,prod} (display name is the key)
+            for key_label, env in (_get(app, ["spec", "kubenvs"], {}) or {}).items():
+                env_obj = env or {}
+                kubenv_ref = env_obj.get("kubenvRef", {}) or {}
+                kubenv_name = kubenv_ref.get("name")
+                if not kubenv_name:
+                    self.log.error(
+                        "kubenv.ref.missing",
+                        message=f"kubenvRef.name missing for kubenvs entry '{key_label}'",
+                    )
+                    continue
+                kubenv_ns = kubenv_ref.get("namespace", "default")
+                # display namespace can be overridden per env, else default
+                display_ns = env_obj.get("namespace", "default")
+                overrides_from_shape_b = {
+                    k: v
+                    for k, v in env_obj.items()
+                    if k in {"resources", "environment", "qualityGates"}
+                }
+                normalized.append(
+                    {
+                        "name": key_label,  # display env name
+                        "namespace": display_ns,  # display env namespace
+                        "kubenvName": kubenv_name,
+                        "kubenvNamespace": kubenv_ns,
+                        "canonical": f"{kubenv_ns}/{kubenv_name}",
+                        "enabled": bool(env_obj.get("enabled", False)),
+                        "overrides": {
+                            **overrides_from_shape_b,
+                            **(env_obj.get("overrides", {}) or {}),
+                        },
+                    }
+                )
+            return normalized
 
-        # Environments - de-duplicate by kubenvRef.name (first-wins for backward compat)
-        env_specs = _get(xr, ["spec", "environments"], []) or []
-        seen_env_names: set[str] = set()
+        raw_envs = _normalize_envs(xr)
+        seen_env_canonicals: set[str] = set()
 
         env_inputs: list[dict[str, Any]] = []
-        for env in env_specs:
-            kubenv_ref = (env or {}).get("kubenvRef", {}) or {}
-            env_name = kubenv_ref.get("name")
-            if not env_name:
-                response.warning(
-                    rsp,
-                    ("environment entry without kubenvRef.name encountered; skipping"),
-                )
+        for env in raw_envs:
+            canonical_key = env.get("canonical")
+            if canonical_key in seen_env_canonicals:
                 continue
-            if env_name in seen_env_names:
-                continue
-            seen_env_names.add(env_name)
-            env_ns = kubenv_ref.get("namespace", "default")
-            env_inputs.append(
-                {
-                    "name": env_name,
-                    "namespace": env_ns,
-                    "enabled": bool((env or {}).get("enabled", False)),
-                    "overrides": (env or {}).get("overrides", {}) or {},
-                }
-            )
+            seen_env_canonicals.add(canonical_key)
+            env_inputs.append(env)
 
         input_items = [
             {
-                "name": e["name"],
-                "namespace": e["namespace"],
+                "display": {
+                    "name": e["name"],
+                    "namespace": e["namespace"],
+                },
+                "kubenvRef": {
+                    "name": e["kubenvName"],
+                    "namespace": e["kubenvNamespace"],
+                },
                 "enabled": e["enabled"],
             }
             for e in env_inputs
@@ -280,8 +330,8 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
             items=input_items,
         )
 
-        # List KubEnv claims only in referenced namespaces
-        namespaces = sorted({e["namespace"] for e in env_inputs})
+        # List KubEnv claims only in referenced namespaces, but only use referenced envs
+        namespaces = sorted({e["kubenvNamespace"] for e in env_inputs})
         log.info(
             "kubenv.list",
             namespaces=namespaces,
@@ -303,10 +353,16 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     error=str(exc),
                 )
 
-        # Build lookup maps
+        # Build a temporary lookup of all claims by canonical key (used only for matching referenced envs)
         def _sanitize_kubenv_claim(obj: dict[str, Any]) -> dict[str, Any]:
             meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
             spec_obj = obj.get("spec", {}) if isinstance(obj, dict) else {}
+            # Keep only fields needed downstream in sanitized spec
+            sanitized_spec = {
+                "resources": spec_obj.get("resources", {}),
+                "environmentConfig": spec_obj.get("environmentConfig", {}),
+                "qualityGates": spec_obj.get("qualityGates", []),
+            }
             return {
                 "apiVersion": obj.get("apiVersion"),
                 "kind": obj.get("kind", "KubEnv"),
@@ -316,13 +372,10 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     "labels": meta.get("labels", {}),
                     "annotations": meta.get("annotations", {}),
                 },
-                "spec": spec_obj,
+                "spec": sanitized_spec,
             }
 
-        kubenv_lookup: dict[str, dict[str, Any]] = {}
-        # Optional alias map: plain name -> list of canonical keys.
-        # Never used for metrics.
-        kubenv_lookup_aliases: dict[str, list[str]] = {}
+        by_canonical: dict[str, dict[str, Any]] = {}
         for item in all_kubenv_claims:
             meta = item.get("metadata", {}) if isinstance(item, dict) else {}
             name = meta.get("name")
@@ -330,44 +383,166 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
             if not name or not ns:
                 continue
             key = f"{ns}/{name}"
-            sanitized = _sanitize_kubenv_claim(item)
-            if key not in kubenv_lookup:
-                kubenv_lookup[key] = sanitized
-            # Track alias mapping separately for backward-compat convenience
-            alias_list = kubenv_lookup_aliases.setdefault(name, [])
-            if key not in alias_list:
-                alias_list.append(key)
+            if key not in by_canonical:
+                by_canonical[key] = item
 
-        # Prepare canonical keys sample for logs
-        canonical_keys_sample: list[str] = []
-        for i in all_kubenv_claims[:5]:
-            meta_i = i.get("metadata", {}) or {}
-            ns_i = meta_i.get("namespace")
-            name_i = meta_i.get("name")
-            canonical_i = f"{ns_i}/{name_i}" if ns_i and name_i else (name_i or "")
-            canonical_keys_sample.append(canonical_i)
+        # Helpers for merge logic
+        def _merge_resource_quota(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+            base_req = (base or {}).get("requests", {}) or {}
+            base_lim = (base or {}).get("limits", {}) or {}
+            ov_req = (override or {}).get("requests", {}) or {}
+            ov_lim = (override or {}).get("limits", {}) or {}
+            merged = {
+                "requests": {**base_req, **ov_req},
+                "limits": {**base_lim, **ov_lim},
+            }
+            return merged
 
-        log.debug(
-            "kubenv.found",
-            total=len(all_kubenv_claims),
-            canonicalKeys=canonical_keys_sample,
-        )
+        def _merge_env_vars(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+            base_vars = base or {}
+            ov_vars = override or {}
+            return {**base_vars, **ov_vars}
+
+        def _canonical_gate_ref(ref: dict[str, Any] | None, default_ns: str) -> tuple[str, dict[str, Any]]:
+            ref = ref or {}
+            name = ref.get("name")
+            ns = ref.get("namespace", default_ns)
+            canonical = f"{ns}/{name}" if name else ""
+            # Ensure ref has namespace filled for output consistency
+            out_ref = {"name": name, "namespace": ns} if name else {}
+            return canonical, out_ref
+
+        def _merge_quality_gates(
+            baseline: list[dict[str, Any]] | None,
+            overrides: list[dict[str, Any]] | None,
+            default_ns: str,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+            base = baseline or []
+            ov = overrides or []
+            base_map: dict[str, dict[str, Any]] = {}
+            ov_map: dict[str, dict[str, Any]] = {}
+            order_keys: list[str] = []
+
+            # Ingest baseline in order; skip non-dict or missing ref
+            for g in base:
+                if not isinstance(g, dict):
+                    continue
+                key_str, out_ref = _canonical_gate_ref((g or {}).get("ref"), default_ns)
+                if not key_str:
+                    continue
+                base_map[key_str] = {
+                    "ref": out_ref,
+                    "key": (g or {}).get("key"),
+                    "phase": (g or {}).get("phase"),
+                    "required": bool((g or {}).get("required", False)),
+                }
+                if key_str not in order_keys:
+                    order_keys.append(key_str)
+
+            # Ingest overrides in order; append new refs to order
+            for g in ov:
+                if not isinstance(g, dict):
+                    continue
+                key_str, out_ref = _canonical_gate_ref((g or {}).get("ref"), default_ns)
+                if not key_str:
+                    continue
+                ov_map[key_str] = {
+                    "ref": out_ref,
+                    "key": (g or {}).get("key"),
+                    "phase": (g or {}).get("phase"),
+                    "required": (g or {}).get("required"),
+                }
+                if key_str not in order_keys:
+                    order_keys.append(key_str)
+
+            merged_list: list[dict[str, Any]] = []
+            active_keys: set[str] = set()
+            proposed_keys: set[str] = set()
+            for k in order_keys:
+                b = base_map.get(k) or {}
+                o = ov_map.get(k) or {}
+                ref_out = (o.get("ref") or b.get("ref") or {})
+                chosen_key = o.get("key") if o.get("key") not in (None, "") else b.get("key")
+                phase = o.get("phase") if o.get("phase") is not None else b.get("phase")
+                required_val = (
+                    bool(o.get("required"))
+                    if o.get("required") is not None
+                    else bool(b.get("required", False))
+                )
+                gate_out = {
+                    "ref": ref_out,
+                    "key": chosen_key,
+                    "phase": phase,
+                    "required": required_val,
+                }
+                merged_list.append(gate_out)
+                # Build commit status sets by phase for non-empty keys only
+                if isinstance(chosen_key, str) and chosen_key:
+                    if phase == "active":
+                        active_keys.add(chosen_key)
+                    elif phase == "proposed":
+                        proposed_keys.add(chosen_key)
+
+            active_statuses = [{"key": k} for k in sorted(active_keys)]
+            proposed_statuses = [{"key": k} for k in sorted(proposed_keys)]
+            return merged_list, active_statuses, proposed_statuses
 
         # Match referenced environments using canonical keys and deduped sets
         referenced_set: set[str] = set()
         found_set: set[str] = set()
         env_resolved: list[dict[str, Any]] = []
+        kubenv_lookup: dict[str, dict[str, Any]] = {}
         for e in env_inputs:
-            canonical = f"{e['namespace']}/{e['name']}"
+            canonical = e["canonical"]
             referenced_set.add(canonical)
-            found_obj = kubenv_lookup.get(canonical)
+            found_obj_raw = by_canonical.get(canonical)
 
-            if found_obj is not None:
+            if found_obj_raw is not None:
                 found_set.add(canonical)
+                # Sanitize claim and spec
+                found_obj = _sanitize_kubenv_claim(found_obj_raw)
+                kubenv_lookup[canonical] = found_obj
                 meta = found_obj.get("metadata", {})
                 labels = meta.get("labels", {}) if isinstance(meta, dict) else {}
                 resource_name = f"{meta.get('namespace')}/{meta.get('name')}"
-                claim_name = labels.get("crossplane.io/claim-name", e["name"])
+                claim_name = labels.get("crossplane.io/claim-name", e.get("kubenvName"))
+                # Effective merges
+                spec_obj = found_obj.get("spec", {})
+                base_defaults = _get(spec_obj, ["resources", "defaults"], {}) or {}
+                overrides_res = _get(e, ["overrides", "resources"], {}) or {}
+                effective_resources = _merge_resource_quota(base_defaults, overrides_res)
+
+                base_env = _get(spec_obj, ["environmentConfig", "variables"], {}) or {}
+                overrides_env = _get(e, ["overrides", "environment"], {}) or {}
+                effective_env = _merge_env_vars(base_env, overrides_env)
+
+                base_gates = spec_obj.get("qualityGates", []) if isinstance(spec_obj, dict) else []
+                override_gates = _get(e, ["overrides", "qualityGates"], []) or []
+                merged_gates, active_statuses, proposed_statuses = _merge_quality_gates(
+                    base_gates, override_gates, e["kubenvNamespace"]
+                )
+                # Merge debug: environment keys and merged gates
+                env_vars_keys = sorted(list(effective_env.keys()))
+                log.debug(
+                    "kubenv.merge",
+                    env=canonical,
+                    envVarKeys=env_vars_keys,
+                    gates=[
+                        {
+                            "ref": g.get("ref"),
+                            "key": g.get("key"),
+                            "phase": g.get("phase"),
+                            "required": g.get("required"),
+                        }
+                        for g in merged_gates
+                    ],
+                )
+                log.debug(
+                    "kubenv.commit-statuses",
+                    env=canonical,
+                    active=[s["key"] for s in active_statuses],
+                    proposed=[s["key"] for s in proposed_statuses],
+                )
                 env_resolved.append(
                     {
                         "name": e["name"],
@@ -377,10 +552,19 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                         "kubenv": {
                             "found": True,
                             "resourceName": resource_name,
-                            "spec": found_obj.get("spec", {}),
+                            "spec": spec_obj,
                             "labels": labels,
                             "annotations": meta.get("annotations", {}),
                             "claimName": claim_name,
+                        },
+                        "effective": {
+                            "resources": effective_resources,
+                            "environment": effective_env,
+                            "qualityGates": merged_gates,
+                            "commitStatuses": {
+                                "activeCommitStatuses": active_statuses,
+                                "proposedCommitStatuses": proposed_statuses,
+                            },
                         },
                     }
                 )
@@ -393,7 +577,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                         "overrides": e["overrides"],
                         "kubenv": {
                             "found": False,
-                            "resourceName": f"{e['namespace']}/{e['name']}",
+                            "resourceName": canonical,
                         },
                     }
                 )
@@ -466,12 +650,6 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         current_ctx[ctx_key] = {
             "appResolved": app_resolved,
             "kubenvLookup": kubenv_lookup,
-            "kubenvLookupAliases": kubenv_lookup_aliases,
-            "allKubenvs": [_sanitize_kubenv_claim(i) for i in all_kubenv_claims],
-            "allKubenvsCount": len(all_kubenv_claims),
-            "$resolved": app_resolved,
-            "$resolvedEnvs": app_resolved.get("environments", []),
-            "$summary": app_resolved.get("summary", {}),
         }
         rsp.context = resource.dict_to_struct(current_ctx)
 
