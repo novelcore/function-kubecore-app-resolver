@@ -17,7 +17,12 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         self, req: fnv1.RunFunctionRequest, _: grpc.aio.ServicerContext
     ) -> fnv1.RunFunctionResponse:
         """Run the function."""
-        log = self.log.bind(tag=req.meta.tag)
+        # Some proto fields may be unset during render; access defensively.
+        try:  # pragma: no cover - simple defensive access
+            tag = req.meta.tag
+        except Exception:  # noqa: BLE001
+            tag = ""
+        log = self.log.bind(tag=tag)
         log.info("Running function")
 
         rsp = response.to(req)
