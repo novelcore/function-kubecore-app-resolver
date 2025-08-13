@@ -19,6 +19,7 @@ import contextlib
 import importlib
 import grpc
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 from crossplane.function import logging, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
@@ -92,6 +93,17 @@ class _KubeLister:
             version="v1alpha1",
             plural="xgithubprojects",
             label_selector=label_selector,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return objs.get("items", [])
+
+    def list_kubenvs_in_namespace(self, namespace: str) -> List[Dict[str, Any]]:
+        # group: platform.kubecore.io, version: v1alpha1, plural: kubenvs
+        objs = self._api.list_namespaced_custom_object(  # type: ignore
+            group="platform.kubecore.io",
+            version="v1alpha1",
+            namespace=namespace,
+            plural="kubenvs",
             timeout_seconds=self.timeout_seconds,
         )
         return objs.get("items", [])
@@ -178,7 +190,17 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         except Exception:
             tag = ""
         log = self.log.bind(tag=tag)
-        log.info("Running function")
+        log.info(
+            "Start",
+            event="Start",
+            step="resolve-app-context",
+            xr={
+                "name": _get(resource.struct_to_dict(req.observed.composite.resource), ["metadata", "name"]),
+                "kind": _get(resource.struct_to_dict(req.observed.composite.resource), ["kind"]),
+                "apiVersion": _get(resource.struct_to_dict(req.observed.composite.resource), ["apiVersion"]),
+            },
+        )
+        t_start = time.time()
 
         # Build a response based on the request using SDK helper.
         rsp = response.to(req)
@@ -207,19 +229,15 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         if project_warning:
             response.warning(rsp, project_warning)
 
-        # Environments - de-duplicate by kubenvRef.name (first-wins)
+        # Environments - de-duplicate by kubenvRef.name (first-wins for backward compat)
         env_specs = _get(xr, ["spec", "environments"], []) or []
         seen_env_names: set[str] = set()
 
-        referenced_names: List[str] = []
-        found_names: List[str] = []
-        env_resolved: List[Dict[str, Any]] = []
-
+        env_inputs: List[Dict[str, Any]] = []
         for env in env_specs:
             kubenv_ref = (env or {}).get("kubenvRef", {}) or {}
             env_name = kubenv_ref.get("name")
             if not env_name:
-                # Skip entries without a name; surface as warning but non-fatal
                 response.warning(
                     rsp,
                     (
@@ -229,52 +247,161 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 )
                 continue
             if env_name in seen_env_names:
-                # First-wins policy
                 continue
             seen_env_names.add(env_name)
-
             env_ns = kubenv_ref.get("namespace", "default")
-            referenced_names.append(env_name)
-
-            # Look up XKubEnv by claim labels
-            kubenv_block: Dict[str, Any]
-            try:
-                items = self._lister.list_xkubenenvs_by_claim(env_name, env_ns)
-            except Exception as exc:
-                msg = f"failed to list XKubEnv for claim {env_name}: {exc}"
-                response.warning(rsp, msg)
-                items = []
-
-            if items:
-                found_names.append(env_name)
-                kubenv_block = _summarize_kubenv(items[0])
-            else:
-                kubenv_block = {"found": False}
-
-            env_resolved.append(
+            env_inputs.append(
                 {
                     "name": env_name,
                     "namespace": env_ns,
                     "enabled": bool((env or {}).get("enabled", False)),
                     "overrides": (env or {}).get("overrides", {}) or {},
-                    "kubenv": kubenv_block,
                 }
             )
 
-        missing_names = sorted(set(referenced_names) - set(found_names))
+        log.debug(
+            "Input environments",
+            event="Input environments",
+            count=len(env_inputs),
+            items=[
+                {"name": e["name"], "namespace": e["namespace"], "enabled": e["enabled"]}
+                for e in env_inputs
+            ],
+        )
+
+        # List KubEnv claims only in referenced namespaces
+        namespaces = sorted({e["namespace"] for e in env_inputs})
+        log.info("Listing KubEnv claims", event="Listing KubEnv claims", namespaces=namespaces, mode="namespaced")
+
+        all_kubenv_claims: List[Dict[str, Any]] = []
+        for ns in namespaces:
+            try:
+                items = self._lister.list_kubenvs_in_namespace(ns)
+                all_kubenv_claims.extend(items)
+            except Exception as exc:  # pragma: no cover - behavior depends on client
+                status = getattr(exc, "status", None)
+                log.error(
+                    "API error",
+                    event="API error",
+                    operation="list KubEnv",
+                    namespace=ns,
+                    status=status,
+                    error=str(exc),
+                )
+
+        # Build lookup maps
+        def _sanitize_kubenv_claim(obj: Dict[str, Any]) -> Dict[str, Any]:
+            meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
+            spec_obj = obj.get("spec", {}) if isinstance(obj, dict) else {}
+            return {
+                "apiVersion": obj.get("apiVersion"),
+                "kind": obj.get("kind", "KubEnv"),
+                "metadata": {
+                    "name": meta.get("name"),
+                    "namespace": meta.get("namespace"),
+                    "labels": meta.get("labels", {}),
+                    "annotations": meta.get("annotations", {}),
+                },
+                "spec": spec_obj,
+            }
+
+        kubenv_lookup: Dict[str, Dict[str, Any]] = {}
+        for item in all_kubenv_claims:
+            meta = item.get("metadata", {}) if isinstance(item, dict) else {}
+            name = meta.get("name")
+            ns = meta.get("namespace")
+            if not name or not ns:
+                continue
+            key = f"{ns}/{name}"
+            sanitized = _sanitize_kubenv_claim(item)
+            if key not in kubenv_lookup:
+                kubenv_lookup[key] = sanitized
+            # Also alias by name for backward-compat convenience
+            if name not in kubenv_lookup:
+                kubenv_lookup[name] = sanitized
+
+        log.debug(
+            "KubEnv claims found",
+            event="KubEnv claims found",
+            total=len(all_kubenv_claims),
+            sample=[
+                {
+                    "ns": (i.get("metadata", {}) or {}).get("namespace"),
+                    "name": (i.get("metadata", {}) or {}).get("name"),
+                }
+                for i in all_kubenv_claims[:5]
+            ],
+        )
+
+        # Match referenced environments
+        referenced_keys: List[str] = []
+        found_keys: List[str] = []
+        env_resolved: List[Dict[str, Any]] = []
+        for e in env_inputs:
+            canonical = f"{e['namespace']}/{e['name']}"
+            referenced_keys.append(canonical)
+            found_obj = kubenv_lookup.get(canonical)
+            if found_obj is None:
+                # try name-only alias (backward-compat convenience)
+                found_obj = kubenv_lookup.get(e["name"])  # type: ignore[assignment]
+
+            if found_obj is not None:
+                found_keys.append(canonical)
+                meta = found_obj.get("metadata", {})
+                labels = meta.get("labels", {}) if isinstance(meta, dict) else {}
+                env_resolved.append(
+                    {
+                        "name": e["name"],
+                        "namespace": e["namespace"],
+                        "enabled": e["enabled"],
+                        "overrides": e["overrides"],
+                        "kubenv": {
+                            "found": True,
+                            "resourceName": f"{meta.get('namespace')}/{meta.get('name')}",
+                            "spec": found_obj.get("spec", {}),
+                            "labels": labels,
+                            "annotations": meta.get("annotations", {}),
+                            "claimName": labels.get("crossplane.io/claim-name", e["name"]),
+                        },
+                    }
+                )
+            else:
+                env_resolved.append(
+                    {
+                        "name": e["name"],
+                        "namespace": e["namespace"],
+                        "enabled": e["enabled"],
+                        "overrides": e["overrides"],
+                        "kubenv": {
+                            "found": False,
+                            "resourceName": f"{e['namespace']}/{e['name']}",
+                        },
+                    }
+                )
+
+        missing_keys = sorted(set(referenced_keys) - set(found_keys))
+        log.debug(
+            "Matched environments",
+            event="Matched environments",
+            foundCount=len(found_keys),
+            found=found_keys,
+            missing=missing_keys,
+        )
+        if missing_keys:
+            log.warning("Missing KubEnvs", event="Missing KubEnvs", missing=missing_keys)
 
         app_resolved = {
             "app": app_obj,
             "project": project_obj,
             "environments": env_resolved,
             "summary": {
-                "referencedKubenvNames": referenced_names,
-                "foundKubenvNames": found_names,
-                "missingKubenvNames": missing_names,
+                "referencedKubenvNames": referenced_keys,
+                "foundKubenvNames": found_keys,
+                "missingKubenvNames": missing_keys,
                 "counts": {
-                    "referenced": len(set(referenced_names)),
-                    "found": len(set(found_names)),
-                    "missing": len(set(missing_names)),
+                    "referenced": len(set(referenced_keys)),
+                    "found": len(set(found_keys)),
+                    "missing": len(set(missing_keys)),
                 },
             },
         }
@@ -282,9 +409,28 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         # Write into namespaced context key
         ctx_key = "apiextensions.crossplane.io/context.kubecore.io"
         current_ctx = resource.struct_to_dict(rsp.context)
-        current_ctx[ctx_key] = {"appResolved": app_resolved}
+        current_ctx[ctx_key] = {
+            "appResolved": app_resolved,
+            "kubenvLookup": kubenv_lookup,
+            "allKubenvs": [
+                _sanitize_kubenv_claim(i) for i in all_kubenv_claims
+            ],
+            "$resolved": app_resolved,
+            "$resolvedEnvs": app_resolved.get("environments", []),
+            "$summary": app_resolved.get("summary", {}),
+        }
         rsp.context = resource.dict_to_struct(current_ctx)
 
         response.normal(rsp, "function-kubecore-app-resolver completed")
-        log.info("Resolve app context complete")
+        log.info(
+            "Context populated",
+            event="Context populated",
+            summary={
+                "referenced": app_resolved["summary"]["referencedKubenvNames"],
+                "found": app_resolved["summary"]["foundKubenvNames"],
+                "missing": app_resolved["summary"]["missingKubenvNames"],
+            },
+            durationMs=int((time.time() - t_start) * 1000),
+        )
+        log.info("Complete", event="Complete", step="resolve-app-context", durationMs=int((time.time() - t_start) * 1000))
         return rsp
