@@ -60,7 +60,11 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         kubenv_item = {
             "apiVersion": "platform.kubecore.io/v1alpha1",
             "kind": "KubEnv",
-            "metadata": {"name": "demo-dev", "namespace": "test", "labels": {"crossplane.io/claim-name": "demo-dev"}},
+            "metadata": {
+                "name": "demo-dev",
+                "namespace": "test",
+                "labels": {"crossplane.io/claim-name": "demo-dev"},
+            },
             "spec": {
                 "environmentType": "dev",
                 "resources": {
@@ -80,7 +84,11 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         kubenv_item_v2 = {
             "apiVersion": "platform.kubecore.io/v1alpha1",
             "kind": "KubEnv",
-            "metadata": {"name": "demo-dev-v2", "namespace": "test", "labels": {"crossplane.io/claim-name": "demo-dev-v2"}},
+            "metadata": {
+                "name": "demo-dev-v2",
+                "namespace": "test",
+                "labels": {"crossplane.io/claim-name": "demo-dev-v2"},
+            },
             "spec": {"environmentType": "dev"},
         }
 
@@ -164,7 +172,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         got_dict = json_format.MessageToDict(got)
         ctx = got_dict["context"]["apiextensions.crossplane.io/context.kubecore.io"]
         resolved = ctx["appResolved"]
-        self.assertEqual(resolved["summary"]["counts"], {"referenced": 2, "found": 1, "missing": 1})
+        self.assertEqual(
+            resolved["summary"]["counts"],
+            {"referenced": 2, "found": 1, "missing": 1},
+        )
         envs = resolved["environments"]
         self.assertFalse(
             next(e for e in envs if e["name"] == "missing-env")["kubenv"]["found"]
@@ -250,7 +261,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         resolved = got_dict["context"][
             "apiextensions.crossplane.io/context.kubecore.io"
         ]["appResolved"]
-        self.assertEqual(resolved["summary"]["counts"], {"referenced": 2, "found": 1, "missing": 1})
+        self.assertEqual(
+            resolved["summary"]["counts"],
+            {"referenced": 2, "found": 1, "missing": 1},
+        )
 
     async def test_multiple_namespaces_found(self) -> None:
         xr = {
@@ -301,7 +315,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         resolved = got_dict["context"][
             "apiextensions.crossplane.io/context.kubecore.io"
         ]["appResolved"]
-        self.assertEqual(resolved["summary"]["counts"], {"referenced": 2, "found": 2, "missing": 0})
+        self.assertEqual(
+            resolved["summary"]["counts"],
+            {"referenced": 2, "found": 2, "missing": 0},
+        )
 
 
 if __name__ == "__main__":

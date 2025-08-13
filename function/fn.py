@@ -51,19 +51,21 @@ class _KubeLister:
         self.timeout_seconds = timeout_seconds
         # If top-level imports were unavailable, import dynamically without
         # using inline import statements to satisfy lint rules.
-        global kube_client, kube_config
-        if kube_client is None or kube_config is None:
+        if kube_client is not None and kube_config is not None:
+            kc = kube_client
+            kcfg = kube_config
+        else:
             k8s = importlib.import_module("kubernetes")  # type: ignore[import-not-found]
-            kube_client = getattr(k8s, "client")  # type: ignore[assignment]
-            kube_config = getattr(k8s, "config")  # type: ignore[assignment]
+            kc = getattr(k8s, "client")  # type: ignore[assignment]
+            kcfg = getattr(k8s, "config")  # type: ignore[assignment]
 
         # Try in-cluster first, fall back to local kubeconfig for development.
         with contextlib.suppress(Exception):
-            kube_config.load_incluster_config()
+            kcfg.load_incluster_config()
         with contextlib.suppress(Exception):
-            kube_config.load_kube_config()
+            kcfg.load_kube_config()
 
-        self._api = kube_client.CustomObjectsApi()  # type: ignore
+        self._api = kc.CustomObjectsApi()  # type: ignore
 
     def list_xkubenenvs_by_claim(
         self, name: str, namespace: Optional[str]
@@ -180,7 +182,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         self.log = logging.get_logger()
         self._lister = lister or _KubeLister()
 
-    async def RunFunction(  # noqa: PLR0915 - function is intentionally linear for clarity
+    async def RunFunction(  # noqa: PLR0915, C901, PLR0912 - intentionally linear for clarity
         self, req: fnv1.RunFunctionRequest, _: grpc.aio.ServicerContext
     ) -> fnv1.RunFunctionResponse:
         """Run the function."""
@@ -190,14 +192,14 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         except Exception:
             tag = ""
         log = self.log.bind(tag=tag)
+        xr_meta = resource.struct_to_dict(req.observed.composite.resource)
         log.info(
             "Start",
-            event="Start",
             step="resolve-app-context",
             xr={
-                "name": _get(resource.struct_to_dict(req.observed.composite.resource), ["metadata", "name"]),
-                "kind": _get(resource.struct_to_dict(req.observed.composite.resource), ["kind"]),
-                "apiVersion": _get(resource.struct_to_dict(req.observed.composite.resource), ["apiVersion"]),
+                "name": _get(xr_meta, ["metadata", "name"]),
+                "kind": _get(xr_meta, ["kind"]),
+                "apiVersion": _get(xr_meta, ["apiVersion"]),
             },
         )
         t_start = time.time()
@@ -209,7 +211,9 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
 
         # Extract app spec
         app_name = (
-            _get(xr, ["spec", "claimRef", "name"]) or _get(xr, ["metadata", "name"]) or ""
+            _get(xr, ["spec", "claimRef", "name"]) 
+            or _get(xr, ["metadata", "name"]) 
+            or ""
         )
         app_obj = {
             "name": app_name,
@@ -259,19 +263,27 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 }
             )
 
+        input_items = [
+            {
+                "name": e["name"],
+                "namespace": e["namespace"],
+                "enabled": e["enabled"],
+            }
+            for e in env_inputs
+        ]
         log.debug(
             "Input environments",
-            event="Input environments",
             count=len(env_inputs),
-            items=[
-                {"name": e["name"], "namespace": e["namespace"], "enabled": e["enabled"]}
-                for e in env_inputs
-            ],
+            items=input_items,
         )
 
         # List KubEnv claims only in referenced namespaces
         namespaces = sorted({e["namespace"] for e in env_inputs})
-        log.info("Listing KubEnv claims", event="Listing KubEnv claims", namespaces=namespaces, mode="namespaced")
+        log.info(
+            "Listing KubEnv claims",
+            namespaces=namespaces,
+            mode="namespaced",
+        )
 
         all_kubenv_claims: List[Dict[str, Any]] = []
         for ns in namespaces:
@@ -282,7 +294,6 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 status = getattr(exc, "status", None)
                 log.error(
                     "API error",
-                    event="API error",
                     operation="list KubEnv",
                     namespace=ns,
                     status=status,
@@ -322,7 +333,6 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
 
         log.debug(
             "KubEnv claims found",
-            event="KubEnv claims found",
             total=len(all_kubenv_claims),
             sample=[
                 {
@@ -349,6 +359,8 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 found_keys.append(canonical)
                 meta = found_obj.get("metadata", {})
                 labels = meta.get("labels", {}) if isinstance(meta, dict) else {}
+                resource_name = f"{meta.get('namespace')}/{meta.get('name')}"
+                claim_name = labels.get("crossplane.io/claim-name", e["name"])
                 env_resolved.append(
                     {
                         "name": e["name"],
@@ -357,11 +369,11 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                         "overrides": e["overrides"],
                         "kubenv": {
                             "found": True,
-                            "resourceName": f"{meta.get('namespace')}/{meta.get('name')}",
+                            "resourceName": resource_name,
                             "spec": found_obj.get("spec", {}),
                             "labels": labels,
                             "annotations": meta.get("annotations", {}),
-                            "claimName": labels.get("crossplane.io/claim-name", e["name"]),
+                            "claimName": claim_name,
                         },
                     }
                 )
@@ -382,13 +394,15 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         missing_keys = sorted(set(referenced_keys) - set(found_keys))
         log.debug(
             "Matched environments",
-            event="Matched environments",
             foundCount=len(found_keys),
             found=found_keys,
             missing=missing_keys,
         )
         if missing_keys:
-            log.warning("Missing KubEnvs", event="Missing KubEnvs", missing=missing_keys)
+            log.warning(
+                "Missing KubEnvs",
+                missing=missing_keys,
+            )
 
         app_resolved = {
             "app": app_obj,
@@ -424,7 +438,6 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         response.normal(rsp, "function-kubecore-app-resolver completed")
         log.info(
             "Context populated",
-            event="Context populated",
             summary={
                 "referenced": app_resolved["summary"]["referencedKubenvNames"],
                 "found": app_resolved["summary"]["foundKubenvNames"],
@@ -432,5 +445,9 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
             },
             durationMs=int((time.time() - t_start) * 1000),
         )
-        log.info("Complete", event="Complete", step="resolve-app-context", durationMs=int((time.time() - t_start) * 1000))
+        log.info(
+            "Complete",
+            step="resolve-app-context",
+            durationMs=int((time.time() - t_start) * 1000),
+        )
         return rsp
