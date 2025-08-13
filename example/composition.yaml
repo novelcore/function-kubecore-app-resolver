@@ -1,0 +1,17 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: function-kubecore-app-resolver
+spec:
+  compositeTypeRef:
+    apiVersion: example.crossplane.io/v1
+    kind: XR
+  mode: Pipeline
+  pipeline:
+  - step: resolve-kubecore-context
+    functionRef:
+      name: function-kubecore-app-resolver
+    input:
+      apiVersion: resolver.fn.kubecore.io/v1beta1
+      kind: Input
+      # No fields required for now
