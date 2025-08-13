@@ -28,10 +28,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 self.kubenv_items_by_name = kubenv_items_by_name
                 self.project_items = project_items
 
-            def list_xkubenenvs_by_claim(self, name, namespace):
+            def list_xkubenenvs_by_claim(self, name, namespace):  # noqa: ARG002
                 return self.kubenv_items_by_name.get(name, [])
 
-            def list_xgithubprojects_by_claim(self, name, namespace):
+            def list_xgithubprojects_by_claim(self, name, namespace):  # noqa: ARG002
                 return self.project_items
 
         xr = {
@@ -44,8 +44,15 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 "port": 8000,
                 "githubProjectRef": {"name": "demo-project", "namespace": "test"},
                 "environments": [
-                    {"kubenvRef": {"name": "demo-dev", "namespace": "test"}, "enabled": True, "overrides": {"replicas": 1}},
-                    {"kubenvRef": {"name": "demo-dev-v2", "namespace": "test"}, "enabled": True},
+                    {
+                        "kubenvRef": {"name": "demo-dev", "namespace": "test"},
+                        "enabled": True,
+                        "overrides": {"replicas": 1},
+                    },
+                    {
+                        "kubenvRef": {"name": "demo-dev-v2", "namespace": "test"},
+                        "enabled": True,
+                    },
                 ],
             },
         }
@@ -54,8 +61,16 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
             "metadata": {"name": "demo-dev-slsf6", "labels": {"crossplane.io/claim-name": "demo-dev"}},
             "spec": {
                 "environmentType": "dev",
-                "resources": {"profile": "small", "defaults": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "256Mi"}}},
-                "environmentConfig": {"variables": {"ENVIRONMENT": "development"}},
+                "resources": {
+                    "profile": "small",
+                    "defaults": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits": {"cpu": "500m", "memory": "256Mi"},
+                    },
+                },
+                "environmentConfig": {
+                    "variables": {"ENVIRONMENT": "development"}
+                },
                 "qualityGates": ["checks"],
                 "kubeClusterRef": {"name": "demo-cluster", "namespace": "test"},
             },
@@ -77,7 +92,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         )
 
         lister = DummyLister(
-            kubenv_items_by_name={"demo-dev": [kubenv_item], "demo-dev-v2": [kubenv_item_v2]},
+            kubenv_items_by_name={
+                "demo-dev": [kubenv_item],
+                "demo-dev-v2": [kubenv_item_v2],
+            },
             project_items=[project_item],
         )
 
@@ -85,12 +103,17 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         got = await runner.RunFunction(req, None)
         got_dict = json_format.MessageToDict(got)
 
-        ctx = got_dict.get("context", {}).get("apiextensions.crossplane.io/context.kubecore.io", {})
+        ctx = got_dict.get("context", {}).get(
+            "apiextensions.crossplane.io/context.kubecore.io", {}
+        )
         self.assertIn("appResolved", ctx)
         resolved = ctx["appResolved"]
         self.assertEqual(resolved["app"]["name"], "art-api")
         self.assertEqual(resolved["project"]["name"], "demo-project")
-        self.assertEqual(resolved["project"].get("providerConfigs", {}).get("github"), "github-default")
+        self.assertEqual(
+            resolved["project"].get("providerConfigs", {}).get("github"),
+            "github-default",
+        )
         names = [e["name"] for e in resolved["environments"]]
         self.assertEqual(names, ["demo-dev", "demo-dev-v2"])  # first-wins keeps order
         self.assertEqual(resolved["summary"]["counts"]["missing"], 0)
@@ -109,12 +132,20 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         }
 
         class DummyLister:
-            def list_xkubenenvs_by_claim(self, name, namespace):
+            def list_xkubenenvs_by_claim(self, name, namespace):  # noqa: ARG002
                 if name == "demo-dev":
-                    return [{"metadata": {"name": "demo-dev-xyz", "labels": {"crossplane.io/claim-name": "demo-dev"}}, "spec": {}}]
+                    return [
+                        {
+                            "metadata": {
+                                "name": "demo-dev-xyz",
+                                "labels": {"crossplane.io/claim-name": "demo-dev"},
+                            },
+                            "spec": {},
+                        }
+                    ]
                 return []
 
-            def list_xgithubprojects_by_claim(self, name, namespace):
+            def list_xgithubprojects_by_claim(self, name, namespace):  # noqa: ARG002
                 return []
 
         req = fnv1.RunFunctionRequest(
@@ -125,17 +156,25 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         runner = fn.FunctionRunner(lister=DummyLister())
         got = await runner.RunFunction(req, None)
         got_dict = json_format.MessageToDict(got)
-        resolved = got_dict["context"]["apiextensions.crossplane.io/context.kubecore.io"]["appResolved"]
+        resolved = got_dict["context"][
+            "apiextensions.crossplane.io/context.kubecore.io"
+        ]["appResolved"]
         self.assertEqual(resolved["summary"]["counts"], {"referenced": 2, "found": 1, "missing": 1})
         envs = resolved["environments"]
-        self.assertFalse([e for e in envs if e["name"] == "missing-env"][0]["kubenv"]["found"])  # type: ignore[index]
+        self.assertFalse(
+            next(e for e in envs if e["name"] == "missing-env")["kubenv"]["found"]
+        )
 
     async def test_no_environments(self) -> None:
-        xr = {"apiVersion": "platform.kubecore.io/v1alpha1", "kind": "XApp", "metadata": {"name": "art-api"}}
+        xr = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "XApp",
+            "metadata": {"name": "art-api"},
+        }
         class DummyLister:
-            def list_xkubenenvs_by_claim(self, name, namespace):
+            def list_xkubenenvs_by_claim(self, name, namespace):  # noqa: ARG002
                 return []
-            def list_xgithubprojects_by_claim(self, name, namespace):
+            def list_xgithubprojects_by_claim(self, name, namespace):  # noqa: ARG002
                 return []
         req = fnv1.RunFunctionRequest(
             observed=fnv1.State(
@@ -145,9 +184,14 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         runner = fn.FunctionRunner(lister=DummyLister())
         got = await runner.RunFunction(req, None)
         got_dict = json_format.MessageToDict(got)
-        resolved = got_dict["context"]["apiextensions.crossplane.io/context.kubecore.io"]["appResolved"]
+        resolved = got_dict["context"][
+            "apiextensions.crossplane.io/context.kubecore.io"
+        ]["appResolved"]
         self.assertEqual(resolved["environments"], [])
-        self.assertEqual(resolved["summary"]["counts"], {"referenced": 0, "found": 0, "missing": 0})
+        self.assertEqual(
+            resolved["summary"]["counts"],
+            {"referenced": 0, "found": 0, "missing": 0},
+        )
 
         # Ensure no unexpected errors when no environments are present
 
