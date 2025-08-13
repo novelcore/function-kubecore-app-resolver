@@ -1,7 +1,7 @@
 """A Crossplane composition function."""
 
 import grpc
-from crossplane.function import logging, response
+from crossplane.function import logging
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
 
@@ -25,10 +25,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         log = self.log.bind(tag=tag)
         log.info("Running function")
 
-        rsp = response.to(req)
-
-        # No-op placeholder: report a normal result to verify wiring works.
-        response.normal(rsp, "function-kubecore-app-resolver scaffold is running")
+        # Build a minimal empty response to verify wiring works without
+        # depending on any optional request fields being present.
         log.info("Scaffold run complete")
-
-        return rsp
+        return fnv1.RunFunctionResponse()
