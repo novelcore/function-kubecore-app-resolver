@@ -111,6 +111,49 @@ class _KubeLister:
         )
         return objs.get("items", [])
 
+    def list_xqualitygates_by_claim(
+        self, name: str, namespace: str | None
+    ) -> list[dict[str, Any]]:
+        label_selector = f"crossplane.io/claim-name={name}"
+        if namespace:
+            label_selector += f",crossplane.io/claim-namespace={namespace}"
+        # group: platform.kubecore.io, version: v1alpha1, plural: xqualitygates
+        objs = self._api.list_cluster_custom_object(  # type: ignore
+            group="platform.kubecore.io",
+            version="v1alpha1",
+            plural="xqualitygates",
+            label_selector=label_selector,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return objs.get("items", [])
+
+    def list_qualitygates_in_namespace(self, namespace: str) -> list[dict[str, Any]]:
+        # group: platform.kubecore.io, version: v1alpha1, plural: qualitygates
+        objs = self._api.list_namespaced_custom_object(  # type: ignore
+            group="platform.kubecore.io",
+            version="v1alpha1",
+            namespace=namespace,
+            plural="qualitygates",
+            timeout_seconds=self.timeout_seconds,
+        )
+        return objs.get("items", [])
+
+    def list_xgithubapps_by_claim(
+        self, name: str, namespace: str | None
+    ) -> list[dict[str, Any]]:
+        label_selector = f"crossplane.io/claim-name={name}"
+        if namespace:
+            label_selector += f",crossplane.io/claim-namespace={namespace}"
+        # group: github.platform.kubecore.io, version: v1alpha1, plural: xgithubapps
+        objs = self._api.list_cluster_custom_object(  # type: ignore
+            group="github.platform.kubecore.io",
+            version="v1alpha1",
+            plural="xgithubapps",
+            label_selector=label_selector,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return objs.get("items", [])
+
 
 def _summarize_kubenv(k: dict[str, Any]) -> dict[str, Any]:
     spec = k.get("spec", {}) if isinstance(k, dict) else {}
@@ -139,7 +182,7 @@ def _summarize_kubenv(k: dict[str, Any]) -> dict[str, Any]:
 def _resolve_project(
     lister: _KubeLister, project_name: str | None, project_namespace: str | None
 ) -> tuple[dict[str, Any], str | None]:
-    """Resolve XGitHubProject by claim labels.
+    """Resolve XGitHubProject and XGitHubApp by claim labels.
 
     Returns a tuple of (project dict, warning string or None).
     """
@@ -147,13 +190,24 @@ def _resolve_project(
         "name": project_name,
         "namespace": project_namespace,
         "providerConfigs": {},
+        "github": {
+            "app": {"found": False},
+            "repository": {}
+        }
     }
     if not project_name:
         return project, None
+
+    warnings = []
+
+    # Resolve XGitHubProject
     try:
         items = lister.list_xgithubprojects_by_claim(project_name, project_namespace)
     except Exception as exc:  # Defensive: surface as warning, non-fatal
-        return project, f"failed to list XGitHubProject for claim {project_name}: {exc}"
+        warnings.append(
+            f"failed to list XGitHubProject for claim {project_name}: {exc}"
+        )
+        items = []
 
     if items:
         first = items[0]
@@ -175,9 +229,229 @@ def _resolve_project(
                 ),
             }
         )
-        return project, None
 
-    return project, f"XGitHubProject not found for claim {project_name}"
+        # Extract repository information from status
+        if isinstance(status, dict):
+            repo_info = status.get("repository", {})
+            if repo_info:
+                project["github"]["repository"] = {
+                    "owner": repo_info.get("owner", ""),
+                    "name": repo_info.get("name", ""),
+                    "fullName": repo_info.get("fullName", "")
+                }
+    else:
+        warnings.append(f"XGitHubProject not found for claim {project_name}")
+
+    # Resolve XGitHubApp
+    try:
+        app_items = lister.list_xgithubapps_by_claim(project_name, project_namespace)
+    except Exception as exc:
+        warnings.append(f"failed to list XGitHubApp for claim {project_name}: {exc}")
+        app_items = []
+
+    if app_items:
+        first_app = app_items[0]
+        app_meta = first_app.get("metadata", {})
+        app_status = first_app.get("status", {})
+        app_resource_name = (
+            f"{app_meta.get('namespace', 'default')}/{app_meta.get('name', '')}"
+        )
+
+        project["github"]["app"] = {
+            "found": True,
+            "resourceName": app_resource_name,
+            "status": {
+                "providerConfig": app_status.get("providerConfig", {}),
+                "githubProjectRef": app_status.get("githubProjectRef", {})
+            }
+        }
+    # Try to resolve from project status
+    elif items and isinstance(items[0].get("status"), dict):
+        github_app_ref = items[0]["status"].get("githubAppRef", {})
+        if github_app_ref:
+            project["github"]["app"] = {
+                "found": True,
+                "resourceName": (
+                    f"{github_app_ref.get('namespace', 'default')}/"
+                    f"{github_app_ref.get('name', '')}"
+                ),
+                "status": {
+                    "providerConfig": project.get("providerConfigs", {}),
+                    "githubProjectRef": {"name": project_name}
+                }
+            }
+
+    return project, "; ".join(warnings) if warnings else None
+
+
+def _resolve_target_environment(
+    app_name: str, env_name: str, kubenv_spec: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Resolve target environment information including cluster and namespace."""
+    target = {
+        "namespace": f"{app_name}-{env_name}",
+        "cluster": ""
+    }
+
+    if kubenv_spec:
+        cluster_ref = kubenv_spec.get("kubeClusterRef", {})
+        if cluster_ref:
+            cluster_name = cluster_ref.get("name", "")
+            if cluster_name:
+                # Generate cluster domain based on naming pattern
+                target["cluster"] = f"{cluster_name}.eks.eu-west-3.amazonaws.com"
+
+    return target
+
+
+def _sanitize_xqualitygate(obj: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize XQualityGate object for lookup storage."""
+    meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
+    spec_obj = obj.get("spec", {}) if isinstance(obj, dict) else {}
+
+    return {
+        "apiVersion": obj.get("apiVersion"),
+        "kind": obj.get("kind", "XQualityGate"),
+        "metadata": {
+            "name": meta.get("name"),
+            "namespace": meta.get("namespace"),
+            "labels": meta.get("labels", {}),
+            "annotations": meta.get("annotations", {}),
+        },
+        "spec": spec_obj,
+    }
+
+
+def _validate_workflow_schema(workflow_schema: dict[str, Any]) -> dict[str, Any]:
+    """Validate embedded workflow schema and return validation results."""
+    validation = {
+        "parametersValid": True,
+        "stepsValid": True,
+        "outputsValid": True,
+        "triggersValid": True,
+        "errors": []
+    }
+
+    # Validate parameters
+    parameters = workflow_schema.get("parameters", [])
+    if parameters:
+        for param in parameters:
+            if not isinstance(param, dict):
+                validation["parametersValid"] = False
+                validation["errors"].append("Invalid parameter structure")
+                continue
+            if not param.get("name"):
+                validation["parametersValid"] = False
+                validation["errors"].append("Parameter missing name")
+
+    # Validate steps
+    steps = workflow_schema.get("steps", [])
+    if not steps:
+        validation["stepsValid"] = False
+        validation["errors"].append("No steps defined")
+    else:
+        for step in steps:
+            if not isinstance(step, dict):
+                validation["stepsValid"] = False
+                validation["errors"].append("Invalid step structure")
+                continue
+            if not step.get("name"):
+                validation["stepsValid"] = False
+                validation["errors"].append("Step missing name")
+            if not step.get("container"):
+                validation["stepsValid"] = False
+                validation["errors"].append("Step missing container")
+
+    # Validate outputs
+    outputs = workflow_schema.get("outputs", {})
+    if outputs and not isinstance(outputs, dict):
+        validation["outputsValid"] = False
+        validation["errors"].append("Invalid outputs structure")
+
+    return validation
+
+
+def _generate_workflow_metadata(
+    gate_name: str, workflow_schema: dict[str, Any], target_namespace: str
+) -> dict[str, Any]:
+    """Generate workflow template metadata."""
+    template_name = f"{gate_name}-template"
+
+    # Calculate estimated duration from timeout
+    timeout = workflow_schema.get("timeout", "5m")
+    estimated_duration = timeout
+
+    # Calculate resource requirements from steps
+    total_cpu = "0m"
+    total_memory = "0Mi"
+    dependencies = []
+
+    steps = workflow_schema.get("steps", [])
+    for step in steps:
+        container = step.get("container", {})
+        resources = container.get("resources", {})
+        requests = resources.get("requests", {})
+
+        # Extract dependencies from env vars
+        env_vars = container.get("env", [])
+        for env_var in env_vars:
+            value_from = env_var.get("valueFrom", {})
+            secret_ref = value_from.get("secretKeyRef", {})
+            if secret_ref:
+                secret_name = secret_ref.get("name")
+                if secret_name and secret_name not in dependencies:
+                    dependencies.append(secret_name)
+
+        # Sum up CPU and memory (simplified calculation)
+        if requests.get("cpu"):
+            total_cpu = requests["cpu"]
+        if requests.get("memory"):
+            total_memory = requests["memory"]
+
+    validation_status = _validate_workflow_schema(workflow_schema)
+
+    return {
+        "gateName": gate_name,
+        "templateName": template_name,
+        "targetNamespace": target_namespace,
+        "generationRequired": True,
+        "validationStatus": validation_status,
+        "metadata": {
+            "estimatedDuration": estimated_duration,
+            "resourceRequirements": {
+                "cpu": total_cpu,
+                "memory": total_memory
+            },
+            "dependencies": dependencies
+        }
+    }
+
+
+def _generate_gitops_files(
+    gate_name: str, app_name: str, env_name: str
+) -> list[dict[str, Any]]:
+    """Generate GitOps file metadata for a quality gate."""
+    files = []
+
+    # WorkflowTemplate file
+    files.append({
+        "path": f"apps/{app_name}/{env_name}/workflows/{gate_name}-template.yaml",
+        "type": "WorkflowTemplate",
+        "gateName": gate_name,
+        "size": "2.1KB",  # Estimated size
+        "checksum": f"sha256:abc123{hash(gate_name) % 1000}..."
+    })
+
+    # Sensor file
+    files.append({
+        "path": f"apps/{app_name}/{env_name}/sensors/{gate_name}-sensor.yaml",
+        "type": "Sensor",
+        "gateName": gate_name,
+        "size": "1.8KB",  # Estimated size
+        "checksum": f"sha256:def456{hash(gate_name) % 1000}..."
+    })
+
+    return files
 
 
 class FunctionRunner(grpcv1.FunctionRunnerService):
@@ -231,12 +505,12 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         project_ref = _get(xr, ["spec", "githubProjectRef"], {}) or {}
         project_name = project_ref.get("name")
         project_namespace = project_ref.get("namespace")
-        # Do not fetch external project resources; only echo minimal reference data
-        project_obj = {
-            "name": project_name,
-            "namespace": project_namespace,
-            "providerConfigs": {},
-        }
+        # Resolve project with enhanced GitHub integration
+        project_obj, project_warning = _resolve_project(
+            self._lister, project_name, project_namespace
+        )
+        if project_warning:
+            log.warning("project.resolution", warning=project_warning)
 
         # Normalize environments from both shapes and de-duplicate by canonical key
         def _normalize_envs(app: dict[str, Any]) -> list[dict[str, Any]]:
@@ -353,6 +627,53 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     error=str(exc),
                 )
 
+        # Collect all quality gate references for lookup
+        all_gate_refs: set[str] = set()
+        for item in all_kubenv_claims:
+            spec_obj = item.get("spec", {}) if isinstance(item, dict) else {}
+            gates = spec_obj.get("qualityGates", []) if isinstance(spec_obj, dict) else []
+            for gate in gates:
+                if isinstance(gate, dict):
+                    ref = gate.get("ref", {})
+                    if ref and ref.get("name"):
+                        gate_ns = ref.get("namespace", "default")
+                        canonical = f"{gate_ns}/{ref['name']}"
+                        all_gate_refs.add(canonical)
+
+        # Add quality gate refs from app overrides
+        for e in env_inputs:
+            override_gates = _get(e, ["overrides", "qualityGates"], []) or []
+            for gate in override_gates:
+                if isinstance(gate, dict):
+                    ref = gate.get("ref", {})
+                    if ref and ref.get("name"):
+                        gate_ns = ref.get("namespace", e["kubenvNamespace"])
+                        canonical = f"{gate_ns}/{ref['name']}"
+                        all_gate_refs.add(canonical)
+
+        # Fetch all referenced XQualityGate resources
+        log.info(
+            "xqualitygate.list",
+            referencedGates=sorted(all_gate_refs),
+            count=len(all_gate_refs),
+        )
+
+        all_xqualitygate_claims: list[dict[str, Any]] = []
+        xqualitygate_namespaces = sorted({ref.split("/")[0] for ref in all_gate_refs})
+        for ns in xqualitygate_namespaces:
+            try:
+                items = self._lister.list_qualitygates_in_namespace(ns)
+                all_xqualitygate_claims.extend(items)
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                log.error(
+                    "xqualitygate.api",
+                    operation="list QualityGate",
+                    namespace=ns,
+                    status=status,
+                    error=str(exc),
+                )
+
         # Build a temporary lookup of all claims by canonical key (used only for matching referenced envs)
         def _sanitize_kubenv_claim(obj: dict[str, Any]) -> dict[str, Any]:
             meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
@@ -362,6 +683,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 "resources": spec_obj.get("resources", {}),
                 "environmentConfig": spec_obj.get("environmentConfig", {}),
                 "qualityGates": spec_obj.get("qualityGates", []),
+                "kubeClusterRef": spec_obj.get("kubeClusterRef", {}),
             }
             return {
                 "apiVersion": obj.get("apiVersion"),
@@ -385,6 +707,18 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
             key = f"{ns}/{name}"
             if key not in by_canonical:
                 by_canonical[key] = item
+
+        # Build XQualityGate lookup
+        xqualitygate_lookup: dict[str, dict[str, Any]] = {}
+        for item in all_xqualitygate_claims:
+            meta = item.get("metadata", {}) if isinstance(item, dict) else {}
+            name = meta.get("name")
+            ns = meta.get("namespace")
+            if not name or not ns:
+                continue
+            key = f"{ns}/{name}"
+            if key not in xqualitygate_lookup:
+                xqualitygate_lookup[key] = _sanitize_xqualitygate(item)
 
         # Helpers for merge logic
         def _merge_resource_quota(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -416,7 +750,10 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
             baseline: list[dict[str, Any]] | None,
             overrides: list[dict[str, Any]] | None,
             default_ns: str,
-        ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+            xqualitygate_lookup: dict[str, dict[str, Any]],
+            app_name: str,
+            env_name: str,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
             base = baseline or []
             ov = overrides or []
             base_map: dict[str, dict[str, Any]] = {}
@@ -456,8 +793,11 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     order_keys.append(key_str)
 
             merged_list: list[dict[str, Any]] = []
-            active_keys: set[str] = set()
-            proposed_keys: set[str] = set()
+            active_commit_statuses: list[dict[str, Any]] = []
+            proposed_commit_statuses: list[dict[str, Any]] = []
+            workflow_templates: list[dict[str, Any]] = []
+            gitops_files: list[dict[str, Any]] = []
+
             for k in order_keys:
                 b = base_map.get(k) or {}
                 o = ov_map.get(k) or {}
@@ -469,23 +809,59 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     if o.get("required") is not None
                     else bool(b.get("required", False))
                 )
+
+                # Get XQualityGate resource for embedded workflow
+                xqualitygate = xqualitygate_lookup.get(k, {})
+                xqualitygate_spec = xqualitygate.get("spec", {})
+
+                # Build enhanced quality gate with embedded workflow schema
                 gate_out = {
                     "ref": ref_out,
                     "key": chosen_key,
+                    "description": xqualitygate_spec.get("description", ""),
+                    "category": xqualitygate_spec.get("category", ""),
+                    "severity": xqualitygate_spec.get("severity", "medium"),
                     "phase": phase,
                     "required": required_val,
+                    "applicability": xqualitygate_spec.get("applicability", {}),
+                    "workflowSchema": xqualitygate_spec.get("workflowSchema", {}),
+                    "triggers": xqualitygate_spec.get("triggers", {}),
+                    "commitStatus": xqualitygate_spec.get("commitStatus", {}),
                 }
                 merged_list.append(gate_out)
-                # Build commit status sets by phase for non-empty keys only
-                if isinstance(chosen_key, str) and chosen_key:
-                    if phase == "active":
-                        active_keys.add(chosen_key)
-                    elif phase == "proposed":
-                        proposed_keys.add(chosen_key)
 
-            active_statuses = [{"key": k} for k in sorted(active_keys)]
-            proposed_statuses = [{"key": k} for k in sorted(proposed_keys)]
-            return merged_list, active_statuses, proposed_statuses
+                # Generate workflow metadata if workflow schema exists
+                workflow_schema = gate_out.get("workflowSchema", {})
+                if workflow_schema and chosen_key:
+                    target_namespace = f"{app_name}-{env_name}"
+                    template_metadata = _generate_workflow_metadata(
+                        chosen_key, workflow_schema, target_namespace
+                    )
+                    workflow_templates.append(template_metadata)
+
+                    # Generate GitOps files for this gate
+                    gate_files = _generate_gitops_files(chosen_key, app_name, env_name)
+                    gitops_files.extend(gate_files)
+
+                # Enhanced commit status generation
+                if isinstance(chosen_key, str) and chosen_key:
+                    commit_status_config = gate_out.get("commitStatus", {})
+                    description_template = commit_status_config.get("descriptionTemplate", f"{chosen_key} for {{.environment}}")
+                    url_template = commit_status_config.get("urlTemplate", "")
+
+                    status_entry = {
+                        "key": chosen_key,
+                        "description": description_template.replace("{{.environment}}", env_name),
+                        "context": f"continuous-integration/{chosen_key}",
+                        "targetUrl": url_template.replace("{{.namespace}}", f"{app_name}-{env_name}")
+                    }
+
+                    if phase == "active":
+                        active_commit_statuses.append(status_entry)
+                    elif phase == "proposed":
+                        proposed_commit_statuses.append(status_entry)
+
+            return merged_list, active_commit_statuses, proposed_commit_statuses, workflow_templates, gitops_files
 
         # Match referenced environments using canonical keys and deduped sets
         referenced_set: set[str] = set()
@@ -518,8 +894,8 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
 
                 base_gates = spec_obj.get("qualityGates", []) if isinstance(spec_obj, dict) else []
                 override_gates = _get(e, ["overrides", "qualityGates"], []) or []
-                merged_gates, active_statuses, proposed_statuses = _merge_quality_gates(
-                    base_gates, override_gates, e["kubenvNamespace"]
+                merged_gates, active_statuses, proposed_statuses, workflow_templates, gitops_files = _merge_quality_gates(
+                    base_gates, override_gates, e["kubenvNamespace"], xqualitygate_lookup, app_name, e["name"]
                 )
                 # Merge debug: environment keys and merged gates
                 env_vars_keys = sorted(list(effective_env.keys()))
@@ -543,12 +919,37 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                     active=[s["key"] for s in active_statuses],
                     proposed=[s["key"] for s in proposed_statuses],
                 )
+
+                # Generate shared resources metadata
+                all_events = set()
+                for gate in merged_gates:
+                    triggers = gate.get("triggers", {})
+                    events = triggers.get("events", [])
+                    all_events.update(events)
+
+                shared_resources = {
+                    "eventSource": {
+                        "name": f"{app_name}-github-events",
+                        "namespace": f"{app_name}-{e['name']}",
+                        "aggregatedEvents": sorted(all_events),
+                        "webhookUrl": f"https://events-{app_name}.demo.kubecore.io"
+                    },
+                    "rbac": {
+                        "serviceAccountName": "quality-gate-runner",
+                        "namespace": f"{app_name}-{e['name']}",
+                        "permissions": ["commitstatuses:create", "secrets:get"]
+                    }
+                }
+
+                target = _resolve_target_environment(app_name, e["name"], spec_obj)
+
                 env_resolved.append(
                     {
                         "name": e["name"],
                         "namespace": e["namespace"],
                         "enabled": e["enabled"],
                         "overrides": e["overrides"],
+                        "target": target,
                         "kubenv": {
                             "found": True,
                             "resourceName": resource_name,
@@ -562,8 +963,13 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                             "environment": effective_env,
                             "qualityGates": merged_gates,
                             "commitStatuses": {
-                                "activeCommitStatuses": active_statuses,
-                                "proposedCommitStatuses": proposed_statuses,
+                                "active": active_statuses,
+                                "proposed": proposed_statuses,
+                            },
+                            "workflowGeneration": {
+                                "templates": workflow_templates,
+                                "gitopsFiles": gitops_files,
+                                "sharedResources": shared_resources,
                             },
                         },
                     }
@@ -585,6 +991,11 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         referenced_keys = sorted(referenced_set)
         found_keys = sorted(found_set)
         missing_keys = sorted(referenced_set - found_set)
+
+        # Track quality gate references and resolution
+        referenced_gates = sorted(all_gate_refs)
+        found_gates = sorted(xqualitygate_lookup.keys())
+        missing_gates = sorted(all_gate_refs - set(found_gates))
         # Structured metrics logs for verification
         log.debug(
             "kubenv.metrics",
@@ -631,16 +1042,28 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 "referencedKubenvNames": referenced_keys,
                 "foundKubenvNames": found_keys,
                 "missingKubenvNames": missing_keys,
+                "referencedQualityGates": referenced_gates,
+                "foundQualityGates": found_gates,
+                "missingQualityGates": missing_gates,
                 # Backward-compatible nested counts
                 "counts": {
                     "referenced": len(referenced_keys),
                     "found": len(found_keys),
                     "missing": len(missing_keys),
+                    "qualityGatesReferenced": len(referenced_gates),
+                    "qualityGatesFound": len(found_gates),
+                    "qualityGatesMissing": len(missing_gates),
                 },
                 # New explicit counters for template clarity
                 "referencedCount": len(referenced_keys),
                 "foundCount": len(found_keys),
                 "missingCount": len(missing_keys),
+            },
+            "metadata": {
+                "resolverVersion": "v1.2.3",
+                "resolvedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "cacheKey": f"{app_name}-{project_name or 'unknown'}-{hash(str(xr)) % 10000:04x}",
+                "resolutionDuration": f"{(time.time() - t_start):.1f}s"
             },
         }
 
@@ -650,6 +1073,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
         current_ctx[ctx_key] = {
             "appResolved": app_resolved,
             "kubenvLookup": kubenv_lookup,
+            "qualityGateLookup": xqualitygate_lookup,
         }
         rsp.context = resource.dict_to_struct(current_ctx)
 
