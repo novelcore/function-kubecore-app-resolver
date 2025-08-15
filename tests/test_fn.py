@@ -548,6 +548,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 "namespace": "test",
             },
             "spec": {
+                "key": "enhanced-security-scan",  # This should be extracted
                 "description": "Static analysis and dependency audit",
                 "category": "security",
                 "severity": "high",
@@ -688,9 +689,11 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         gates = effective["qualityGates"]
         self.assertEqual(len(gates), 1)
         gate = gates[0]
+        self.assertEqual(gate["key"], "enhanced-security-scan")  # Extracted from QualityGate.spec.key
         self.assertEqual(gate["description"], "Static analysis and dependency audit")
         self.assertEqual(gate["category"], "security")
         self.assertEqual(gate["severity"], "high")
+        self.assertIn("parameters", gate)  # Parameters from KubEnv configuration
         self.assertIn("workflowSchema", gate)
         self.assertIn("triggers", gate)
         self.assertIn("commitStatus", gate)
@@ -704,8 +707,8 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         templates = workflow_gen["templates"]
         self.assertEqual(len(templates), 1)
         template = templates[0]
-        self.assertEqual(template["gateName"], "security-scan")
-        self.assertEqual(template["templateName"], "security-scan-template")
+        self.assertEqual(template["gateName"], "enhanced-security-scan")
+        self.assertEqual(template["templateName"], "enhanced-security-scan-template")
         self.assertTrue(template["generationRequired"])
         self.assertIn("validationStatus", template)
         self.assertIn("metadata", template)
@@ -721,7 +724,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         proposed = commit_statuses["proposed"]
         self.assertEqual(len(proposed), 1)
         status = proposed[0]
-        self.assertEqual(status["key"], "security-scan")
+        self.assertEqual(status["key"], "enhanced-security-scan")
         self.assertIn("description", status)
         self.assertIn("context", status)
         self.assertIn("targetUrl", status)
@@ -898,6 +901,86 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         gate = gates[0]
         self.assertEqual(gate["key"], "missing-gate")
         self.assertEqual(gate["workflowSchema"], {})  # Empty since gate not found
+
+    async def test_quality_gate_key_fallback_behavior(self) -> None:
+        """Test that key falls back to KubEnv configuration when QualityGate.spec.key is missing."""
+        xr = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "XApp",
+            "metadata": {"name": "test-app"},
+            "spec": {
+                "environments": [
+                    {
+                        "kubenvRef": {"name": "test-dev", "namespace": "test"},
+                        "enabled": True,
+                    }
+                ],
+            },
+        }
+
+        kubenv_item = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "KubEnv",
+            "metadata": {
+                "name": "test-dev",
+                "namespace": "test",
+                "labels": {"crossplane.io/claim-name": "test-dev"},
+            },
+            "spec": {
+                "qualityGates": [
+                    {
+                        "ref": {"name": "fallback-gate", "namespace": "test"},
+                        "key": "kubenv-fallback-key",  # This should be used as fallback
+                        "phase": "active",
+                        "required": True,
+                    }
+                ],
+            },
+        }
+
+        # Quality gate without spec.key - should fallback to KubEnv key
+        qualitygate_item = {
+            "apiVersion": "platform.kubecore.io/v1alpha1",
+            "kind": "QualityGate",
+            "metadata": {
+                "name": "fallback-gate",
+                "namespace": "test",
+            },
+            "spec": {
+                # No "key" field - should fallback to KubEnv configuration
+                "description": "Gate without spec.key for fallback testing",
+                "category": "testing",
+                "severity": "low",
+            },
+        }
+
+        req = fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=fnv1.Resource(resource=resource.dict_to_struct(xr)),
+            )
+        )
+
+        lister = self.DummyLister(
+            kubenv_items_by_ns={"test": [kubenv_item]},
+            project_items=[],
+            qualitygate_items_by_ns={"test": [qualitygate_item]},
+        )
+
+        runner = fn.FunctionRunner(lister=lister)
+        got = await runner.RunFunction(req, None)
+        got_dict = json_format.MessageToDict(got)
+
+        ctx = got_dict["context"]["apiextensions.crossplane.io/context.kubecore.io"]
+        resolved = ctx["appResolved"]
+
+        # Check that fallback key is used
+        env = resolved["environments"][0]
+        gates = env["effective"]["qualityGates"]
+        self.assertEqual(len(gates), 1)
+        gate = gates[0]
+        self.assertEqual(gate["key"], "kubenv-fallback-key")  # Should use KubEnv key as fallback
+        self.assertEqual(gate["description"], "Gate without spec.key for fallback testing")
+        self.assertEqual(gate["category"], "testing")
 
 
 if __name__ == "__main__":

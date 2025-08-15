@@ -814,15 +814,34 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 xqualitygate = xqualitygate_lookup.get(k, {})
                 xqualitygate_spec = xqualitygate.get("spec", {})
 
+                # Extract key from QualityGate spec.key, fallback to KubEnv key
+                qg_key = xqualitygate_spec.get("key")
+                resolved_key = qg_key if qg_key not in (None, "") else chosen_key
+
+                # Extract parameters from KubEnv configuration
+                kubenv_gate_config = {}
+                kubenv_params = {}
+                
+                # Get parameters from base and override configurations
+                base_gate_config = next((g for g in (base if isinstance(base, list) else []) if isinstance(g, dict) and g.get("ref", {}).get("name") == ref_out.get("name")), {})
+                override_gate_config = next((g for g in (ov if isinstance(ov, list) else []) if isinstance(g, dict) and g.get("ref", {}).get("name") == ref_out.get("name")), {})
+                
+                # Merge parameters from base and override
+                if isinstance(base_gate_config, dict):
+                    kubenv_params.update(base_gate_config.get("parameters", {}) or {})
+                if isinstance(override_gate_config, dict):
+                    kubenv_params.update(override_gate_config.get("parameters", {}) or {})
+
                 # Build enhanced quality gate with embedded workflow schema
                 gate_out = {
                     "ref": ref_out,
-                    "key": chosen_key,
+                    "key": resolved_key,
                     "description": xqualitygate_spec.get("description", ""),
                     "category": xqualitygate_spec.get("category", ""),
                     "severity": xqualitygate_spec.get("severity", "medium"),
                     "phase": phase,
                     "required": required_val,
+                    "parameters": kubenv_params,  # from KubEnv configuration
                     "applicability": xqualitygate_spec.get("applicability", {}),
                     "workflowSchema": xqualitygate_spec.get("workflowSchema", {}),
                     "triggers": xqualitygate_spec.get("triggers", {}),
@@ -832,27 +851,27 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
 
                 # Generate workflow metadata if workflow schema exists
                 workflow_schema = gate_out.get("workflowSchema", {})
-                if workflow_schema and chosen_key:
+                if workflow_schema and resolved_key:
                     target_namespace = f"{app_name}-{env_name}"
                     template_metadata = _generate_workflow_metadata(
-                        chosen_key, workflow_schema, target_namespace
+                        resolved_key, workflow_schema, target_namespace
                     )
                     workflow_templates.append(template_metadata)
 
                     # Generate GitOps files for this gate
-                    gate_files = _generate_gitops_files(chosen_key, app_name, env_name)
+                    gate_files = _generate_gitops_files(resolved_key, app_name, env_name)
                     gitops_files.extend(gate_files)
 
                 # Enhanced commit status generation
-                if isinstance(chosen_key, str) and chosen_key:
+                if isinstance(resolved_key, str) and resolved_key:
                     commit_status_config = gate_out.get("commitStatus", {})
-                    description_template = commit_status_config.get("descriptionTemplate", f"{chosen_key} for {{.environment}}")
+                    description_template = commit_status_config.get("descriptionTemplate", f"{resolved_key} for {{.environment}}")
                     url_template = commit_status_config.get("urlTemplate", "")
 
                     status_entry = {
-                        "key": chosen_key,
+                        "key": resolved_key,
                         "description": description_template.replace("{{.environment}}", env_name),
-                        "context": f"continuous-integration/{chosen_key}",
+                        "context": f"continuous-integration/{resolved_key}",
                         "targetUrl": url_template.replace("{{.namespace}}", f"{app_name}-{env_name}")
                     }
 
@@ -1060,7 +1079,7 @@ class FunctionRunner(grpcv1.FunctionRunnerService):
                 "missingCount": len(missing_keys),
             },
             "metadata": {
-                "resolverVersion": "v1.2.3",
+                "resolverVersion": "v1.3.0",
                 "resolvedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "cacheKey": f"{app_name}-{project_name or 'unknown'}-{hash(str(xr)) % 10000:04x}",
                 "resolutionDuration": f"{(time.time() - t_start):.1f}s"
